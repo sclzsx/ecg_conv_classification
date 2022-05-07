@@ -8,42 +8,64 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 
-from dataset import AutoencoderDataset
-from models import autoencoder, convautoencoder
+from dataset import ECGDataset, extract_labels, label_dict_decode
+from vgg import VGG
+from resnet import RESNET
+from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score, confusion_matrix
+from collections import Counter
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # 自动选择用cpu还是gpu
 
 batch_size = 64
 max_epoch = 50
 
-do_eval = 1
+model_id = 0
 
-model_id = 1
+
+def get_labels_weight(labels, method=0):
+    distribute = dict(Counter(labels.flatten()))
+
+    num_classes = len(distribute)
+
+    num_labels = [i for i in distribute.values()]
+    max_num_labels = max(num_labels)
+
+    weight = np.zeros(num_classes)
+
+    for i in range(num_classes):
+        if method == 0:
+            weight[i] = 1 / distribute[i]
+        else:
+            weight[i] = max_num_labels / distribute[i]
+
+    return weight
+
 
 def train():
     if model_id == 0:
-        model = autoencoder().to(device)
-        save_dir = 'results/autoencoder/'
+        model = VGG().to(device)
+        save_dir = 'results/VGG/'
     else:
-        model = convautoencoder().to(device)
-        save_dir = 'results/convautoencoder/'
+        model = RESNET().to(device)
+        save_dir = 'results/RESNET/'
 
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
-    train_dataset = AutoencoderDataset('./data/normal_train.csv')
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    train_data = np.array(pd.read_csv('./data/train_data.csv'))
+    train_labels = np.array(pd.read_csv('./data/train_labels.csv'))
+    print(train_data.shape, train_labels.shape)
 
-    if do_eval:
-        test_dataset1 = AutoencoderDataset('./data/normal_test.csv')
-        test_dataset2 = AutoencoderDataset('./data/abnormal_test.csv')
-        max_f = -1
+    train_dataset = ECGDataset(data=train_data, labels=train_labels, augment=False)
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     print('Finish loading dataset, begin training.')
 
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    # criterion = torch.nn.MSELoss(reduction='mean')
-    criterion = torch.nn.L1Loss(reduction='mean')
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+    weight = torch.tensor(get_labels_weight(train_labels), dtype=torch.float32).to(device)
+
+    criterion = nn.CrossEntropyLoss(weight=weight).to(device)
 
     for epoch in range(1, max_epoch + 1):  # range的区间是左闭右开,所以加1
 
@@ -51,19 +73,20 @@ def train():
 
         mean_loss = 0
 
-        for i, batch_data in enumerate(train_dataloader):  # 遍历train_dataloader,每次返回一个批次,i记录批次id
-            
+        for i, (batch_data, batch_labels) in enumerate(train_dataloader):  # 遍历train_dataloader,每次返回一个批次,i记录批次id
+            # print(batch_data.shape, batch_labels.shape)
             batch_data = batch_data.to(device)  # 若环境可用gpu,自动将tensor转为cuda格式
+            batch_labels = batch_labels.to(device)  # 若环境可用gpu,自动将tensor转为cuda格式
 
             optimizer.zero_grad()  # 清零已有梯度
 
             batch_pred = model(batch_data)  # 前向传播,获得网络的输出
 
-            batch_loss = criterion(batch_pred, batch_data)
+            batch_loss = criterion(batch_pred, batch_labels)
 
             batch_loss_val = batch_loss.item()
 
-            if i % 1000 == 0:
+            if i % 50 == 0:
                 print(epoch, i, batch_loss_val)
 
             mean_loss = mean_loss + batch_loss_val  # 累加所有批次的平均损失. item()的意思是取数值,因为该变量不是一个tensor
@@ -74,135 +97,10 @@ def train():
 
         mean_loss = mean_loss / (i + 1)  # 损失和求均,为当前epoch的损失
 
-        log = {'epoch': epoch, 'loss': mean_loss}
+        log = {'epoch': epoch, 'mean loss': mean_loss}
         print('######', log)
 
-        if do_eval:
-
-            model.eval()
-
-            all_loss = []
-            for i, batch_data in enumerate(train_dataloader):
-
-                with torch.no_grad():
-                    batch_data = batch_data.to(device) 
-
-                    batch_pred = model(batch_data)
-
-                    batch_loss = criterion(batch_pred, batch_data)
-                    batch_loss_val = batch_loss.item()
-                    all_loss.append(batch_loss_val)
-
-            # assert len(all_loss) == len(train_dataset)
-            all_loss = np.array(all_loss)
-            # print(all_loss.shape)
-            min_loss = np.min(all_loss)
-            max_loss = np.max(all_loss)
-            mean_loss = np.mean(all_loss)
-            std_loss = np.std(all_loss)
-
-            threshold = mean_loss + std_loss
-
-            # normal: P, abnormal: N
-
-            all_loss = []
-            TP, FP = 0, 0
-            for i, data in enumerate(test_dataset1):
-                with torch.no_grad():
-                    data = data.unsqueeze(0).to(device)
-                    # print(data.shape)
-                    pred = model(data)
-                    loss = criterion(pred, data).cpu().numpy()
-                    all_loss.append(loss)
-                    # print('loss:{}, thresh:{}'.format(loss, mean_loss))
-                    
-                    # if loss < min_loss or loss > max_loss:
-                    if loss > threshold:
-                        FP = FP + 1
-                    else:
-                        TP = TP + 1
-
-            all_loss = []
-            TN, FN = 0, 0
-            for i, data in enumerate(test_dataset2):
-                with torch.no_grad():
-                    data = data.unsqueeze(0).to(device)
-                    # print(data.shape)
-                    pred = model(data)
-                    loss = criterion(pred, data).cpu().numpy()
-                    all_loss.append(loss)
-
-                    # if loss < min_loss or loss > max_loss:
-                    if loss > threshold:
-                        TN = TN + 1
-                    else:
-                        FN = FN + 1
-
-            p = TP / (TP + FP)
-            r = TP / (TP + FN)
-            f = 2 * p * r / (p + r)
-            if f > max_f:
-                max_f = f
-                log = {'epoch': epoch, 'p':p, 'r':r, 'f1': f}
-                print('++++++', log)
-                torch.save(model.state_dict(), save_dir + 'best.pth')
-
-    torch.save(model.state_dict(), save_dir + 'last.pth')
-
-
-def cal_threshold():
-
-    if model_id == 0:
-        model = autoencoder().to(device)
-        save_dir = 'results/autoencoder/'
-    else:
-        model = convautoencoder().to(device)
-        save_dir = 'results/convautoencoder/'
-
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-
-    train_dataset = AutoencoderDataset('./data/normal_train.csv')
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    print('Finish loading dataset, begin calculating threshold.')
-
-    # model = convautoencoder().to(device)
-    # criterion = torch.nn.L1Loss(reduction='none')
-    criterion = torch.nn.L1Loss(reduction='mean')
-
-    model_path = save_dir + 'best.pth'
-    model.load_state_dict(torch.load(model_path))
-
-    all_loss = []
-    for i, batch_data in enumerate(train_dataloader):
-
-        with torch.no_grad():
-            batch_data = batch_data.to(device) 
-
-            batch_pred = model(batch_data)
-
-            batch_loss = criterion(batch_pred, batch_data)
-            batch_loss_val = batch_loss.item()
-            all_loss.append(batch_loss_val)
-
-    # assert len(all_loss) == len(train_dataset)
-    all_loss = np.array(all_loss)
-    # print(all_loss.shape)
-    min_loss = np.min(all_loss)
-    max_loss = np.max(all_loss)
-    mean_loss = np.mean(all_loss)
-    std_loss = np.std(all_loss)
-
-    thresh_path = save_dir + 'thresh.txt'
-    with open(thresh_path, 'w') as f:
-        f.write(str(min_loss))
-        f.write(' ')
-        f.write(str(max_loss))
-        f.write(' ')
-        f.write(str(mean_loss))
-        f.write(' ')
-        f.write(str(std_loss))
-
+        torch.save(model.state_dict(), save_dir + 'latest.pth')
 
 
 def visualize_tensor_in_out(input, output, save_path):
@@ -217,104 +115,132 @@ def visualize_tensor_in_out(input, output, save_path):
     plt.savefig(save_path)
     plt.cla()
 
-def test():
-    
+
+def plot_confusion_matrix(confusion, save_path):
+    # 热度图，后面是指定的颜色块，可设置其他的不同颜色
+    plt.imshow(confusion, cmap=plt.cm.Blues)
+    # ticks 坐标轴的坐标点
+    # label 坐标轴标签说明
+    indices = range(len(extract_labels))
+    # 第一个是迭代对象，表示坐标的显示顺序，第二个参数是坐标轴显示列表
+    # axis = [str(i) for i in range(num_classes)]
+    plt.xticks(indices, extract_labels)
+    plt.yticks(indices, extract_labels)
+
+    plt.colorbar()
+
+    plt.xlabel('预测值')
+    plt.ylabel('真实值')
+    plt.title('混淆矩阵')
+
+    # plt.rcParams两行是用于解决标签不能显示汉字的问题
+    plt.rcParams['font.sans-serif'] = ['SimHei']
+    plt.rcParams['axes.unicode_minus'] = False
+
+    # 显示数据
+    for first_index in range(len(confusion)):  # 第几行
+        for second_index in range(len(confusion[first_index])):  # 第几列
+            plt.text(first_index, second_index, confusion[first_index][second_index])
+    # 在matlab里面可以对矩阵直接imagesc(confusion)
+
+    plt.savefig(save_path)
+    plt.cla()
+
+
+def eval():
     if model_id == 0:
-        model = autoencoder().to(device)
-        save_dir = 'results/autoencoder/'
+        model = VGG().to(device)
+        save_dir = 'results/VGG/'
     else:
-        model = convautoencoder().to(device)
-        save_dir = 'results/convautoencoder/'
+        model = RESNET().to(device)
+        save_dir = 'results/RESNET/'
 
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
-    with open(save_dir + 'thresh.txt', 'r') as f:
-        line = f.readline().split(' ')
-        min_loss = float(line[0])
-        max_loss = float(line[1])
-        mean_loss = float(line[2])
-        std_loss = float(line[3])
-    print('min_loss:{}, max_loss:{}, mean_loss:{}, mean_loss:{}'.format(min_loss, max_loss, mean_loss, std_loss))
+    test_data = np.array(pd.read_csv('./data/test_data.csv'))
+    test_labels = np.squeeze(np.array(pd.read_csv('./data/test_labels.csv')))
+    test_dataset = ECGDataset(data=test_data, labels=test_labels, augment=False)
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    threshold = mean_loss + std_loss
-
-    test_dataset1 = AutoencoderDataset('./data/normal_test.csv')
-    test_dataset2 = AutoencoderDataset('./data/abnormal_test.csv')
     print('Finish loading dataset, begin testing.')
 
-    # model = convautoencoder().to(device)
-    criterion = torch.nn.L1Loss(reduction='mean')
-
-    model_path = save_dir + 'best.pth'
+    model_path = save_dir + 'latest.pth'
     model.load_state_dict(torch.load(model_path))
 
-    # normal: P, abnormal: N
-
-    all_loss = []
-    TP, FP = 0, 0
-    for i, data in enumerate(test_dataset1):
+    all_labels = []
+    all_preds = []
+    for i, (batch_data, batch_labels) in enumerate(test_dataloader):  # 遍历train_dataloader,每次返回一个批次,i记录批次id
         with torch.no_grad():
-            data = data.unsqueeze(0).to(device)
-            # print(data.shape)
-            pred = model(data)
-            loss = criterion(pred, data).cpu().numpy()
-            all_loss.append(loss)
-            # print('loss:{}, thresh:{}'.format(loss, mean_loss))
-            
-            if i % 20 == 0:
-                visualize_tensor_in_out(data, pred, save_dir + 'normal_test_' + str(i) + '.jpg')
+            batch_data = batch_data.to(device)  # 若环境可用gpu,自动将tensor转为cuda格式
+            batch_pred = model(batch_data)  # 前向传播,获得网络的输出
 
-            # if loss < min_loss or loss > max_loss:
-            if loss > threshold:
-                # print('pred N, but real P')
-                FP = FP + 1
-            else:
-                # print('pred P, and real P')
-                TP = TP + 1
+            preds = batch_pred.squeeze().cpu().numpy().argmax(axis=1)  # 依次进行: 降维,转为cpu张量,转为np,求每一行最大值的索引
+            labels = batch_labels.squeeze().cpu().numpy()
 
-    avg_loss = np.mean(all_loss)
-    print('avg_loss of normal_test', avg_loss)
+            all_labels.extend(list(labels))
+            all_preds.extend(list(preds))
+
+    acc = accuracy_score(all_labels, all_preds)
+    p = precision_score(all_labels, all_preds, average='weighted')
+    r = recall_score(all_labels, all_preds, average='weighted')
+    f1 = f1_score(all_labels, all_preds, average='weighted')
+    conf = confusion_matrix(all_labels, all_preds)
+    metrics = {'accuracy': acc, 'precision': p, 'recall': r, 'f1_score': f1}
+    print(metrics)
+
+    plot_confusion_matrix(conf, save_dir + 'confusion_matrix.png')
 
 
-    all_loss = []
-    TN, FN = 0, 0
-    for i, data in enumerate(test_dataset2):
+def demo():
+    if model_id == 0:
+        model = VGG().to(device)
+        save_dir = 'results/VGG/'
+    else:
+        model = RESNET().to(device)
+        save_dir = 'results/RESNET/'
+
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    test_data = np.array(pd.read_csv('./data/test_data.csv'))
+    test_labels = np.squeeze(np.array(pd.read_csv('./data/test_labels.csv')))
+    test_dataset = ECGDataset(data=test_data, labels=test_labels, augment=False)
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=True)
+
+    print('Finish loading dataset, begin testing.')
+
+    model_path = save_dir + 'latest.pth'
+    model.load_state_dict(torch.load(model_path))
+
+    for i, (batch_data, batch_labels) in enumerate(test_dataloader):  # 遍历train_dataloader,每次返回一个批次,i记录批次id
         with torch.no_grad():
-            data = data.unsqueeze(0).to(device)
-            # print(data.shape)
-            pred = model(data)
-            loss = criterion(pred, data).cpu().numpy()
-            all_loss.append(loss)
-            # print('loss:{}, thresh:{}'.format(loss, mean_loss))
+            batch_data = batch_data.to(device)  # 若环境可用gpu,自动将tensor转为cuda格式
+            batch_pred = model(batch_data)  # 前向传播,获得网络的输出
 
-            if i % 20 == 0:
-                visualize_tensor_in_out(data, pred, save_dir + 'abnormal_test_' + str(i) + '.jpg')
+            pred = batch_pred.cpu().numpy().argmax(axis=1)  # 依次进行: 降维,转为cpu张量,转为np,求每一行最大值的索引
 
-            # if loss < min_loss or loss > max_loss:
-            if loss > threshold:
-                # print('pred N, and real N')
-                TN = TN + 1
+            lab = batch_labels.squeeze().cpu().item()
+            pre = pred[0]
+            if lab == pre:
+                flag = True
+                color = 'green'
             else:
-                # print('pred P, but real N')
-                FN = FN + 1
+                flag = False
+                color = 'red'
 
-    # avg_loss = np.mean(all_loss)
-    # print('avg_loss of normal_test', avg_loss)
+            text = 'Label is :{}, Prediction is :{}, Recognized :{}'.format(label_dict_decode[lab],
+                                                                            label_dict_decode[pre], flag)
+            print(text)
 
-    p = TP / (TP + FP)
+            plt.title(text)
+            plt.plot(np.arange(256), batch_data.squeeze().cpu().numpy(), color=color)
+            plt.show()
 
-    r = TP / (TP + FN)
-
-    f = 2 * p * r / (p + r)
-    
-    print('precison:{}, recall:{}, f1:{}'.format(p, r, f))
-            
 
 if __name__ == '__main__':
+    # train()
 
-    train()
+    eval()
 
-    cal_threshold()
-
-    test()
+    demo()
